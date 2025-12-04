@@ -1,27 +1,20 @@
 # mcap-foxglove-video-extract
 
+Rust CLI that lists `foxglove.CompressedVideo` topics in an MCAP file or extracts them to MP4 using GStreamer.
+
 ## Usage
-```
-usage: main.py [-h] [--output OUTPUT] mcap_file [topic]
-
-List topics containing foxglove.CompressedVideo messages in an MCAP file or
-extract a specific video topic
-
-positional arguments:
-  mcap_file        Path to MCAP file
-  topic            Topic name to extract video from, use 'all' to extract all
-                   topics
-
-options:
-  -h, --help       show this help message and exit
-  --output OUTPUT  Output directory
-
-```
 
 ```sh
-docker run -v ~/Downloads:/video extractor /video/recorder_20250822_014827.mcap video/UDPStream0/stream --output /video
+mcap-foxglove-video-extract <mcap_file> [topic] [--output <output_dir>]
 ```
 
+- No `topic` argument: list topics and durations.
+- `topic=all`: extract every `foxglove.CompressedVideo` topic to MP4.
+- Specific `topic`: extract only that topic.
+
+Examples:
+
 ```sh
-uv run main.py ~/Downloads/recorder_20250822_014827.mcap
+mcap-foxglove-video-extract potato.mcap
+mcap-foxglove-video-extract potato.mcap video/UDPStream0/stream --output ./out
 ```

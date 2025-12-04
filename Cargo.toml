@@ -1,0 +1,14 @@
+[package]
+name = "mcap-foxglove-video-extract"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+cdr = "0.2.4"
+clap = { version = "4.5.53", features = ["derive"] }
+gstreamer = "0.24.4"
+gstreamer-app = "0.24.4"
+mcap = "0.24.0"
+memmap2 = "0.9.9"
+serde = { version = "1.0.228", features = ["derive"] }
