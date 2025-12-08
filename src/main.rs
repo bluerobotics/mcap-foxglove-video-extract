@@ -198,7 +198,7 @@ fn extract_video(mapped: &memmap2::Mmap, topic: &str, output_dir: &Path) -> Resu
 
     appsrc.end_of_stream().context("failed to signal EOS")?;
     let msg = bus.timed_pop_filtered(
-        gst::ClockTime::from_seconds(30),
+        gst::ClockTime::NONE, // We wait forever to allow low end devices to finish
         &[gst::MessageType::Eos, gst::MessageType::Error],
     );
 
