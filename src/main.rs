@@ -3,6 +3,7 @@ mod cli;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     fs,
     path::Path,
 };
@@ -18,6 +19,42 @@ use mcap::MessageStream;
 use memmap2::MmapOptions;
 
 const MESSAGE_SCHEMA_NAME: &str = "foxglove.CompressedVideo";
+
+/// Supported video codecs for extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoFormat {
+    H264,
+    H265,
+}
+
+impl VideoFormat {
+    /// Parse the video format from a Foxglove CompressedVideo format string.
+    pub fn from_format_string(format: &str) -> Option<Self> {
+        let normalized = format.to_lowercase();
+        match normalized.as_str() {
+            "h264" | "avc" | "h.264" => Some(VideoFormat::H264),
+            "h265" | "hevc" | "h.265" => Some(VideoFormat::H265),
+            _ => None,
+        }
+    }
+
+    /// Returns the file extension for output files.
+    pub fn file_extension(&self) -> &'static str {
+        match self {
+            VideoFormat::H264 => "mp4",
+            VideoFormat::H265 => "mp4",
+        }
+    }
+}
+
+impl fmt::Display for VideoFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VideoFormat::H264 => write!(f, "H.264"),
+            VideoFormat::H265 => write!(f, "H.265"),
+        }
+    }
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -65,18 +102,23 @@ fn map_mcap(path: &Path) -> Result<memmap2::Mmap> {
 }
 
 fn list_video_topics(mapped: &memmap2::Mmap) -> Result<()> {
-    let durations = get_topic_durations(mapped)?;
-    if durations.is_empty() {
+    let info = get_topic_info(mapped)?;
+    if info.is_empty() {
         println!("No foxglove.CompressedVideo messages found");
         return Ok(());
     }
 
     println!("\nFound foxglove.CompressedVideo messages on topics:");
-    let mut topics: Vec<_> = durations.keys().cloned().collect();
+    let mut topics: Vec<_> = info.keys().cloned().collect();
     topics.sort();
     for topic in topics {
-        let seconds = durations.get(&topic).copied().unwrap_or(0);
-        println!("- {topic} ({seconds}s)");
+        if let Some((duration, format)) = info.get(&topic) {
+            let format_str = format
+                .as_ref()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("- {topic} ({format_str}, {duration}s)");
+        }
     }
 
     Ok(())
@@ -93,8 +135,12 @@ fn get_video_topics(mapped: &memmap2::Mmap) -> Result<HashSet<String>> {
     Ok(topics)
 }
 
-fn get_topic_durations(mapped: &memmap2::Mmap) -> Result<HashMap<String, u64>> {
-    let mut spans: HashMap<String, (Option<u64>, Option<u64>)> = HashMap::new();
+/// Information about a video topic: (duration_seconds, detected_format)
+type TopicInfo = (u64, Option<VideoFormat>);
+
+fn get_topic_info(mapped: &memmap2::Mmap) -> Result<HashMap<String, TopicInfo>> {
+    let mut spans: HashMap<String, (Option<u64>, Option<u64>, Option<VideoFormat>)> =
+        HashMap::new();
 
     for msg in MessageStream::new(mapped)? {
         let msg = msg?;
@@ -108,38 +154,64 @@ fn get_topic_durations(mapped: &memmap2::Mmap) -> Result<HashMap<String, u64>> {
         let ts = video.timestamp.as_nanos();
         let entry = spans
             .entry(msg.channel.topic.clone())
-            .or_insert((None, None));
+            .or_insert((None, None, None));
+
         if entry.0.is_none() {
             entry.0 = Some(ts);
+            entry.2 = VideoFormat::from_format_string(&video.format);
         }
         entry.1 = Some(ts);
     }
 
-    let durations = spans
+    let info = spans
         .into_iter()
-        .map(|(topic, (first, last))| {
+        .map(|(topic, (first, last, format))| {
             let duration = match (first, last) {
                 (Some(start), Some(end)) if end >= start => (end - start) / 1_000_000_000,
                 _ => 0,
             };
-            (topic, duration)
+            (topic, (duration, format))
         })
         .collect();
 
-    Ok(durations)
+    Ok(info)
+}
+
+fn detect_video_format(mapped: &memmap2::Mmap, topic: &str) -> Result<VideoFormat> {
+    for msg in MessageStream::new(mapped)? {
+        let msg = msg?;
+        if !(is_video_message(&msg) && msg.channel.topic == topic) {
+            continue;
+        }
+
+        let video = decode_compressed_video(msg.data.as_ref())
+            .with_context(|| format!("failed to decode first video message on {topic}"))?;
+
+        return VideoFormat::from_format_string(&video.format).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported video format '{}' on topic {topic}. Supported formats: h264, h265/hevc",
+                video.format
+            )
+        });
+    }
+
+    Err(anyhow::anyhow!(
+        "no video messages found on topic {topic}"
+    ))
 }
 
 fn extract_video(mapped: &memmap2::Mmap, topic: &str, output_dir: &Path) -> Result<()> {
+    let format = detect_video_format(mapped, topic)?;
     println!(
-        "Extracting video from topic {topic} in {}",
+        "Extracting {format} video from topic {topic} to {}",
         output_dir.display()
     );
     gst::init()?;
 
     let safe_topic = topic.replace('/', "_");
-    let output_file = output_dir.join(format!("{safe_topic}.mp4"));
+    let output_file = output_dir.join(format!("{safe_topic}.{}", format.file_extension()));
 
-    let (pipeline, appsrc) = build_pipeline(&output_file)?;
+    let (pipeline, appsrc) = build_pipeline(&output_file, format)?;
     let bus = pipeline.bus().context("pipeline missing bus")?;
 
     pipeline
@@ -227,7 +299,17 @@ fn extract_video(mapped: &memmap2::Mmap, topic: &str, output_dir: &Path) -> Resu
     res
 }
 
-fn build_pipeline(output_path: &Path) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+fn build_pipeline(
+    output_path: &Path,
+    format: VideoFormat,
+) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    match format {
+        VideoFormat::H264 => build_pipeline_h264(output_path),
+        VideoFormat::H265 => build_pipeline_h265(output_path),
+    }
+}
+
+fn build_pipeline_h264(output_path: &Path) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let pipeline = gst::Pipeline::new();
 
     let caps = gst::Caps::builder("video/x-h264")
@@ -265,6 +347,51 @@ fn build_pipeline(output_path: &Path) -> Result<(gst::Pipeline, gst_app::AppSrc)
     gst::Element::link_many([
         appsrc.upcast_ref::<gst::Element>(),
         h264parse.as_ref(),
+        mp4mux.as_ref(),
+        filesink.as_ref(),
+    ])?;
+
+    Ok((pipeline, appsrc))
+}
+
+fn build_pipeline_h265(output_path: &Path) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    let pipeline = gst::Pipeline::new();
+
+    let caps = gst::Caps::builder("video/x-h265")
+        .field("stream-format", "byte-stream")
+        .field("framerate", gst::Fraction::new(30, 1))
+        .build();
+
+    let appsrc = gst_app::AppSrc::builder()
+        .name("src")
+        .caps(&caps)
+        .is_live(false)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+    appsrc.set_do_timestamp(true);
+
+    let h265parse = gst::ElementFactory::make("h265parse")
+        .build()
+        .context("missing h265parse element")?;
+    let mp4mux = gst::ElementFactory::make("mp4mux")
+        .property("faststart", true)
+        .build()
+        .context("missing mp4mux element")?;
+    let filesink = gst::ElementFactory::make("filesink")
+        .property("location", output_path.to_string_lossy().to_string())
+        .build()
+        .context("missing filesink element")?;
+
+    pipeline.add_many([
+        appsrc.upcast_ref::<gst::Element>(),
+        h265parse.as_ref(),
+        mp4mux.as_ref(),
+        filesink.as_ref(),
+    ])?;
+    gst::Element::link_many([
+        appsrc.upcast_ref::<gst::Element>(),
+        h265parse.as_ref(),
         mp4mux.as_ref(),
         filesink.as_ref(),
     ])?;
