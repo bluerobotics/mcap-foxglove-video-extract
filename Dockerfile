@@ -1,5 +1,5 @@
 # Builder stage: compile the Rust binary with GStreamer support
-FROM rust:1.82-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
@@ -17,7 +17,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
 
 RUN cargo build --release
